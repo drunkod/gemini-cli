@@ -33,6 +33,10 @@ const OAUTH_SCOPE = [
   'https://www.googleapis.com/auth/userinfo.profile',
 ];
 
+// Add these new constants at the top of oauth2.ts
+const CLOUD_IDE_REDIRECT_PATH = '/oauth2callback';
+const DEFAULT_CLOUD_IDE_PORT = 37967; // Use the port from your error message
+
 const HTTP_REDIRECT = 301;
 const SIGN_IN_SUCCESS_URL =
   'https://developers.google.com/gemini-code-assist/auth_success_gemini';
@@ -50,6 +54,22 @@ const CREDENTIAL_FILENAME = 'oauth_creds.json';
 export interface OauthWebLogin {
   authUrl: string;
   loginCompletePromise: Promise<void>;
+}
+
+// Add this new function to detect cloud IDE environment
+function isCloudIDE(): boolean {
+  return process.env.CLOUD_IDE === 'true' ||
+         process.env.CODESPACES === 'true' ||
+         !!process.env.CLOUD_WORKSPACE_ID;
+}
+
+// Add this function to get the cloud IDE callback URL
+function getCloudIDECallbackUrl(port: number): string {
+  const baseUrl = process.env.CLOUD_IDE_URL || process.env.WORKSPACE_URL;
+  if (!baseUrl) {
+    throw new Error('Cloud IDE URL environment variable not set');
+  }
+  return `${baseUrl}:${port}${CLOUD_IDE_REDIRECT_PATH}`;
 }
 
 export async function getOauthClient(): Promise<OAuth2Client> {
@@ -79,10 +99,13 @@ export async function getOauthClient(): Promise<OAuth2Client> {
 }
 
 async function authWithWeb(client: OAuth2Client): Promise<OauthWebLogin> {
-  const port = await getAvailablePort();
-  const redirectUri = `http://localhost:${port}/oauth2callback`;
+  const port = isCloudIDE() ? DEFAULT_CLOUD_IDE_PORT : await getAvailablePort();
+  const redirectUri = isCloudIDE()
+    ? getCloudIDECallbackUrl(port)
+    : `http://localhost:${port}${CLOUD_IDE_REDIRECT_PATH}`;
+
   const state = crypto.randomBytes(32).toString('hex');
-  const authUrl: string = client.generateAuthUrl({
+  const authUrl = client.generateAuthUrl({
     redirect_uri: redirectUri,
     access_type: 'offline',
     scope: OAUTH_SCOPE,
@@ -92,43 +115,70 @@ async function authWithWeb(client: OAuth2Client): Promise<OauthWebLogin> {
   const loginCompletePromise = new Promise<void>((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       try {
-        if (req.url!.indexOf('/oauth2callback') === -1) {
+        if (!req.url || !req.url.includes(CLOUD_IDE_REDIRECT_PATH)) {
           res.writeHead(HTTP_REDIRECT, { Location: SIGN_IN_FAILURE_URL });
           res.end();
           reject(new Error('Unexpected request: ' + req.url));
+          return;
         }
-        // acquire the code from the querystring, and close the web server.
-        const qs = new url.URL(req.url!, 'http://localhost:3000').searchParams;
+
+        const qs = new url.URL(req.url, redirectUri).searchParams;
+
         if (qs.get('error')) {
           res.writeHead(HTTP_REDIRECT, { Location: SIGN_IN_FAILURE_URL });
           res.end();
-
           reject(new Error(`Error during authentication: ${qs.get('error')}`));
-        } else if (qs.get('state') !== state) {
-          res.end('State mismatch. Possible CSRF attack');
-
-          reject(new Error('State mismatch. Possible CSRF attack'));
-        } else if (qs.get('code')) {
-          const { tokens } = await client.getToken({
-            code: qs.get('code')!,
-            redirect_uri: redirectUri,
-          });
-          client.setCredentials(tokens);
-          await cacheCredentials(client.credentials);
-
-          res.writeHead(HTTP_REDIRECT, { Location: SIGN_IN_SUCCESS_URL });
-          res.end();
-          resolve();
-        } else {
-          reject(new Error('No code found in request'));
+          return;
         }
+
+        if (qs.get('state') !== state) {
+          res.writeHead(400, { 'Content-Type': 'text/plain' });
+          res.end('State mismatch. Possible CSRF attack');
+          reject(new Error('State mismatch. Possible CSRF attack'));
+          return;
+        }
+
+        if (qs.get('code')) {
+          try {
+            const { tokens } = await client.getToken({
+              code: qs.get('code')!,
+              redirect_uri: redirectUri,
+            });
+            client.setCredentials(tokens);
+            await cacheCredentials(client.credentials);
+            res.writeHead(HTTP_REDIRECT, { Location: SIGN_IN_SUCCESS_URL });
+            res.end();
+            resolve();
+          } catch (error) {
+            res.writeHead(HTTP_REDIRECT, { Location: SIGN_IN_FAILURE_URL });
+            res.end();
+            reject(error);
+          }
+          return;
+        }
+
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('No code found in request');
+        reject(new Error('No code found in request'));
       } catch (e) {
+        if (!res.writableEnded) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('Internal server error');
+        }
         reject(e);
       } finally {
         server.close();
       }
     });
-    server.listen(port);
+
+    server.on('error', (error) => {
+      console.error('Server error:', error);
+      reject(error);
+    });
+
+    server.listen(port, () => {
+      console.log(`OAuth callback server listening on port ${port}`);
+    });
   });
 
   return {
