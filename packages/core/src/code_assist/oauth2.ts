@@ -14,6 +14,17 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import * as os from 'os';
 
+// Modify the getRedirectUri function
+function getRedirectUri(localPort: number): string {
+  if (isCloudIDE()) {
+    if (!CLOUD_IDE_URL || !OAUTH_CALLBACK_PORT) {
+      throw new Error('Cloud IDE environment variables CLOUD_IDE_URL or OAUTH_CALLBACK_PORT not set');
+    }
+    return `${CLOUD_IDE_URL}:${OAUTH_CALLBACK_PORT}${CLOUD_IDE_REDIRECT_PATH}`;
+  }
+  return `http://localhost:${localPort}${CLOUD_IDE_REDIRECT_PATH}`;
+}
+
 //  OAuth Client ID used to initiate OAuth2Client class.
 const OAUTH_CLIENT_ID =
   '681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com';
@@ -36,6 +47,10 @@ const OAUTH_SCOPE = [
 // Add these new constants at the top of oauth2.ts
 const CLOUD_IDE_REDIRECT_PATH = '/oauth2callback';
 const DEFAULT_CLOUD_IDE_PORT = 37967; // Use the port from your error message
+
+// Add these constants
+const CLOUD_IDE_URL = process.env.CLOUD_IDE_URL;
+const OAUTH_CALLBACK_PORT = process.env.OAUTH_CALLBACK_PORT;
 
 const HTTP_REDIRECT = 301;
 const SIGN_IN_SUCCESS_URL =
@@ -61,15 +76,6 @@ function isCloudIDE(): boolean {
   return process.env.CLOUD_IDE === 'true' ||
          process.env.CODESPACES === 'true' ||
          !!process.env.CLOUD_WORKSPACE_ID;
-}
-
-// Add this function to get the cloud IDE callback URL
-function getCloudIDECallbackUrl(port: number): string {
-  const baseUrl = process.env.CLOUD_IDE_URL || process.env.WORKSPACE_URL;
-  if (!baseUrl) {
-    throw new Error('Cloud IDE URL environment variable not set');
-  }
-  return `${baseUrl}:${port}${CLOUD_IDE_REDIRECT_PATH}`;
 }
 
 export async function getOauthClient(): Promise<OAuth2Client> {
@@ -99,10 +105,10 @@ export async function getOauthClient(): Promise<OAuth2Client> {
 }
 
 async function authWithWeb(client: OAuth2Client): Promise<OauthWebLogin> {
-  const port = isCloudIDE() ? DEFAULT_CLOUD_IDE_PORT : await getAvailablePort();
-  const redirectUri = isCloudIDE()
-    ? getCloudIDECallbackUrl(port)
-    : `http://localhost:${port}${CLOUD_IDE_REDIRECT_PATH}`;
+  const listeningPort = isCloudIDE() ? DEFAULT_CLOUD_IDE_PORT : await getAvailablePort();
+  const redirectUri = getRedirectUri(listeningPort);
+  console.log('Using redirect URI:', redirectUri);
+  console.log('OAuth server listening on port:', listeningPort);
 
   const state = crypto.randomBytes(32).toString('hex');
   const authUrl = client.generateAuthUrl({
@@ -176,8 +182,8 @@ async function authWithWeb(client: OAuth2Client): Promise<OauthWebLogin> {
       reject(error);
     });
 
-    server.listen(port, () => {
-      console.log(`OAuth callback server listening on port ${port}`);
+    server.listen(listeningPort, () => {
+      // console.log(`OAuth callback server listening on port ${listeningPort}`); // Covered by earlier log
     });
   });
 
